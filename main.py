@@ -51,27 +51,11 @@ st.markdown("""
         100% { opacity: 1; }
     }
 
-    /* Video container */
     .video-container {
         border: 2px solid #e94560; border-radius: 12px;
         overflow: hidden; box-shadow: 0 8px 30px rgba(233,69,96,0.3);
     }
 
-    /* Capture button */
-    div[data-testid="stButton"].capture-btn > button {
-        background: linear-gradient(135deg, #e94560, #c73652) !important;
-        color: white !important; border: none !important;
-        border-radius: 8px !important; font-weight: 700 !important;
-        letter-spacing: 2px !important; font-size: 0.9rem !important;
-        box-shadow: 0 4px 15px rgba(233,69,96,0.4) !important;
-        transition: all 0.3s ease !important;
-    }
-    div[data-testid="stButton"].capture-btn > button:hover {
-        transform: translateY(-2px) !important;
-        box-shadow: 0 6px 20px rgba(233,69,96,0.6) !important;
-    }
-
-    /* Download buttons */
     .stDownloadButton > button {
         background: linear-gradient(135deg, #0f3460, #16213e) !important;
         color: white !important; border: 1px solid #e94560 !important;
@@ -83,17 +67,6 @@ st.markdown("""
         transform: translateY(-2px) !important;
     }
 
-    /* Clear button */
-    div[data-testid="stButton"].clear-btn > button {
-        background: transparent !important; color: #e94560 !important;
-        border: 1px solid #e94560 !important; border-radius: 8px !important;
-        font-size: 0.8rem !important; letter-spacing: 1px !important;
-    }
-    div[data-testid="stButton"].clear-btn > button:hover {
-        background: rgba(233,69,96,0.1) !important;
-    }
-
-    /* Sidebar */
     .sidebar-title {
         color: #e94560; font-size: 0.85rem; font-weight: 600;
         text-transform: uppercase; letter-spacing: 1px;
@@ -101,7 +74,6 @@ st.markdown("""
         border-bottom: 1px solid rgba(233,69,96,0.2);
     }
 
-    /* Capture info card */
     .capture-info {
         background: rgba(233,69,96,0.05);
         border: 1px solid rgba(233,69,96,0.2);
@@ -116,7 +88,6 @@ st.markdown("""
     .capture-info-label { color: #718096; }
     .capture-info-value { color: #e94560; font-weight: 600; }
 
-    /* Gallery header */
     .gallery-header {
         color: #e94560; font-size: 0.85rem; font-weight: 600;
         text-transform: uppercase; letter-spacing: 1px;
@@ -131,16 +102,20 @@ st.markdown("""
         color: #a0aec0 !important; font-size: 0.85rem;
         text-transform: uppercase; letter-spacing: 0.5px;
     }
+
+    /* Capture button */
+    div[data-testid="stButton"] button {
+        transition: all 0.2s ease !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─── Global shared store (survives reruns via cache_resource) ─────────────────
-# cache_resource returns the SAME object every run → safe to mutate from any thread
+# ─── Global shared store via cache_resource (survives reruns, thread-safe) ────
 @st.cache_resource
 def get_shared_store():
     return {
-        "latest_frame"   : None,   # numpy BGR
+        "latest_frame"   : None,
         "detection_count": 0,
         "tracked_ids"    : set(),
         "lock"           : threading.Lock(),
@@ -148,23 +123,31 @@ def get_shared_store():
 
 @st.cache_resource
 def get_track_history():
-    """Persists between reruns; only touched by callback thread."""
     return defaultdict(list)
 
-
-shared = get_shared_store()
-track_history = get_track_history()
-
-# ─── Disk save directory ──────────────────────────────────────────────────────
-SAVE_DIR = Path("captured_frames")
-SAVE_DIR.mkdir(exist_ok=True)
-
-# ─── Model ────────────────────────────────────────────────────────────────────
+# ─── Model — load once, warm up immediately ───────────────────────────────────
 @st.cache_resource
 def load_model():
-    return YOLO("yolov8n.pt")
+    m = YOLO("yolov8n.pt")
+    # Warm-up pass so first real frame isn't slow
+    dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+    m.predict(dummy, verbose=False)
+    return m
 
-model = load_model()
+# ─── Frame-skip counter (module-level int inside a mutable container) ─────────
+@st.cache_resource
+def get_frame_counter():
+    # [current_count, skip_every_n]
+    return {"count": 0, "last_result": None}
+
+
+shared        = get_shared_store()
+track_history = get_track_history()
+model         = load_model()
+frame_counter = get_frame_counter()
+
+SAVE_DIR = Path("captured_frames")
+SAVE_DIR.mkdir(exist_ok=True)
 
 # ─── COCO classes ─────────────────────────────────────────────────────────────
 COCO_CLASSES = {
@@ -187,19 +170,83 @@ COCO_CLASSES = {
     79:'toothbrush',
 }
 
-def get_class_color(class_id: int):
-    rng = np.random.default_rng(class_id)
-    return tuple(rng.integers(50, 255, 3).tolist())
+# Pre-compute colors once
+_CLASS_COLORS: dict[int, tuple] = {}
+def get_class_color(class_id: int) -> tuple:
+    if class_id not in _CLASS_COLORS:
+        rng = np.random.default_rng(class_id)
+        _CLASS_COLORS[class_id] = tuple(rng.integers(80, 255, 3).tolist())
+    return _CLASS_COLORS[class_id]
 
 
-# ─── Session state defaults ───────────────────────────────────────────────────
-for key, default in [
-    ("saved_frames", []),
-    ("capture_meta", None),
-    ("last_capture_time", None),
-]:
-    if key not in st.session_state:
-        st.session_state[key] = default
+# ─── Session-state defaults ───────────────────────────────────────────────────
+for k, v in [("saved_frames", []), ("capture_meta", None),
+             ("last_capture_time", None)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ─── Sidebar (read before callback so values are ready) ───────────────────────
+with st.sidebar:
+    st.markdown("""
+    <div style="text-align:center;padding:1rem 0;
+                border-bottom:1px solid #2d3748;margin-bottom:1rem;">
+        <div style="font-size:1.2rem;font-weight:700;
+                    color:#e94560;letter-spacing:2px;">CONTROL PANEL</div>
+        <div style="font-size:0.75rem;color:#a0aec0;margin-top:0.3rem;">
+            Detection Configuration
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-title">Detection Settings</div>',
+                unsafe_allow_html=True)
+    confidence_threshold = st.slider(
+        "Confidence Threshold", 0.1, 1.0, 0.5, 0.05)
+
+    st.markdown('<div class="sidebar-title">Performance</div>',
+                unsafe_allow_html=True)
+    # Key perf knob: only run inference every N frames
+    infer_every = st.slider(
+        "Infer Every N Frames", 1, 6, 2, 1,
+        help="Skip frames between inferences. Higher = faster but less smooth.")
+    
+    # Resolution scale: downscale before inference, display original
+    infer_scale = st.select_slider(
+        "Inference Resolution",
+        options=[0.25, 0.5, 0.75, 1.0],
+        value=0.5,
+        help="Lower = faster inference. Display is always full resolution."
+    )
+
+    st.markdown('<div class="sidebar-title">Tracking Settings</div>',
+                unsafe_allow_html=True)
+    show_trails     = st.toggle("Show Movement Trails", value=True)
+    trail_length    = st.slider("Trail Length", 5, 60, 20, 5)
+    show_labels     = st.toggle("Show Labels", value=True)
+    show_confidence = st.toggle("Show Confidence", value=True)
+
+    st.markdown('<div class="sidebar-title">Display Settings</div>',
+                unsafe_allow_html=True)
+    bbox_thickness = st.slider("Bounding Box Thickness", 1, 4, 2, 1)
+
+    st.markdown('<div class="sidebar-title">Capture Settings</div>',
+                unsafe_allow_html=True)
+    capture_quality         = st.select_slider(
+        "JPEG Quality", options=[60, 70, 80, 90, 95, 100], value=90)
+    add_timestamp_watermark = st.toggle("Add Timestamp Watermark", value=True)
+    max_saved_frames        = st.slider("Max Saved Frames", 5, 50, 20, 5)
+
+    st.markdown("""
+    <div style="margin-top:2rem;padding:1rem;
+                background:rgba(233,69,96,0.05);
+                border:1px solid rgba(233,69,96,0.2);border-radius:8px;">
+        <div style="color:#e94560;font-weight:600;
+                    font-size:0.85rem;margin-bottom:0.5rem;">MODEL INFO</div>
+        <div style="color:#a0aec0;font-size:0.8rem;line-height:1.8;">
+            Model: YOLOv8n<br>Classes: 80 COCO<br>
+            Framework: Ultralytics<br>Tracker: ByteTrack
+        </div>
+    </div>""", unsafe_allow_html=True)
 
 
 # ─── Header ───────────────────────────────────────────────────────────────────
@@ -222,80 +269,62 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ─── Sidebar ──────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("""
-    <div style="text-align:center;padding:1rem 0;
-                border-bottom:1px solid #2d3748;margin-bottom:1rem;">
-        <div style="font-size:1.2rem;font-weight:700;
-                    color:#e94560;letter-spacing:2px;">CONTROL PANEL</div>
-        <div style="font-size:0.75rem;color:#a0aec0;margin-top:0.3rem;">
-            Detection Configuration
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-    st.markdown('<div class="sidebar-title">Detection Settings</div>',
-                unsafe_allow_html=True)
-    confidence_threshold = st.slider(
-        "Confidence Threshold", 0.1, 1.0, 0.5, 0.05,
-        help="Minimum confidence score for object detection")
-
-    st.markdown('<div class="sidebar-title">Tracking Settings</div>',
-                unsafe_allow_html=True)
-    show_trails     = st.toggle("Show Movement Trails", value=True)
-    trail_length    = st.slider("Trail Length", 5, 60, 30, 5)
-    show_labels     = st.toggle("Show Labels", value=True)
-    show_confidence = st.toggle("Show Confidence", value=True)
-
-    st.markdown('<div class="sidebar-title">Display Settings</div>',
-                unsafe_allow_html=True)
-    bbox_thickness = st.slider("Bounding Box Thickness", 1, 5, 2, 1)
-
-    st.markdown('<div class="sidebar-title">Capture Settings</div>',
-                unsafe_allow_html=True)
-    capture_quality = st.select_slider(
-        "JPEG Quality", options=[60, 70, 80, 90, 95, 100], value=95)
-    add_timestamp_watermark = st.toggle("Add Timestamp Watermark", value=True)
-    max_saved_frames = st.slider("Max Saved Frames", 5, 50, 20, 5)
-
-    st.markdown("""
-    <div style="margin-top:2rem;padding:1rem;
-                background:rgba(233,69,96,0.05);
-                border:1px solid rgba(233,69,96,0.2);border-radius:8px;">
-        <div style="color:#e94560;font-weight:600;
-                    font-size:0.85rem;margin-bottom:0.5rem;">MODEL INFO</div>
-        <div style="color:#a0aec0;font-size:0.8rem;line-height:1.8;">
-            Model: YOLOv8n<br>Classes: 80 COCO<br>
-            Framework: Ultralytics<br>Tracker: BoT-SORT
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-
 # ─── Video frame callback ─────────────────────────────────────────────────────
 def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     img = frame.to_ndarray(format="bgr24")
     h, w = img.shape[:2]
 
-    results = model.track(
-        img, persist=True,
-        conf=confidence_threshold,
-        verbose=False,
-        tracker="botsort.yaml",
-    )
+    frame_counter["count"] = (frame_counter["count"] + 1) % max(infer_every, 1)
+    run_inference = (frame_counter["count"] == 0)
 
-    annotated   = img.copy()
+    # ── Downscale for inference only ──────────────────────────────────────────
+    if infer_scale < 1.0:
+        small_w = int(w * infer_scale)
+        small_h = int(h * infer_scale)
+        infer_img = cv2.resize(img, (small_w, small_h),
+                               interpolation=cv2.INTER_LINEAR)
+    else:
+        infer_img = img
+        small_w, small_h = w, h
+
+    scale_x = w / small_w
+    scale_y = h / small_h
+
+    annotated   = img.copy()      # draw on full-res
     det_count   = 0
     tracked_ids = set()
 
-    if results[0].boxes is not None and len(results[0].boxes) > 0:
+    if run_inference:
+        results = model.track(
+            infer_img,
+            persist=True,
+            conf=confidence_threshold,
+            verbose=False,
+            tracker="bytetrack.yaml",   # lighter than botsort
+            imgsz=640,                  # fixed inference size cap
+        )
+        frame_counter["last_result"] = results
+    else:
+        results = frame_counter["last_result"]
+
+    if results is not None and \
+       results[0].boxes is not None and \
+       len(results[0].boxes) > 0:
+
         boxes     = results[0].boxes
         det_count = len(boxes)
 
         for box in boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            # Scale coords back to full resolution
+            x1s, y1s, x2s, y2s = box.xyxy[0].tolist()
+            x1 = int(x1s * scale_x)
+            y1 = int(y1s * scale_y)
+            x2 = int(x2s * scale_x)
+            y2 = int(y2s * scale_y)
+
             conf       = float(box.conf[0])
             cls_id     = int(box.cls[0])
-            class_name = COCO_CLASSES.get(cls_id, f"class_{cls_id}")
+            class_name = COCO_CLASSES.get(cls_id, f"cls{cls_id}")
             track_id   = int(box.id[0]) if box.id is not None else None
 
             if track_id is not None:
@@ -304,7 +333,8 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
             color = get_class_color(cls_id)
 
             # Bounding box
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, bbox_thickness)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2),
+                          color, bbox_thickness)
 
             # Corner accents
             cl = max(1, min(15, (x2 - x1) // 4, (y2 - y1) // 4))
@@ -320,15 +350,15 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
             # Movement trail
             if show_trails and track_id is not None:
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                track_history[track_id].append((cx, cy))
-                if len(track_history[track_id]) > trail_length:
-                    track_history[track_id].pop(0)
-                pts = track_history[track_id]
-                for i in range(1, len(pts)):
-                    alpha = i / len(pts)
+                hist = track_history[track_id]
+                hist.append((cx, cy))
+                if len(hist) > trail_length:
+                    del hist[0]
+                for i in range(1, len(hist)):
+                    alpha = i / len(hist)
                     tc    = tuple(int(c * alpha) for c in color)
-                    th    = max(1, int(bbox_thickness * alpha))
-                    cv2.line(annotated, pts[i - 1], pts[i], tc, th)
+                    cv2.line(annotated, hist[i - 1], hist[i],
+                             tc, max(1, int(bbox_thickness * alpha)))
 
             # Label
             if show_labels:
@@ -340,39 +370,39 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
                     parts.append(f"{conf:.0%}")
                 label = " | ".join(parts)
 
-                (lw, lh), baseline = cv2.getTextSize(
+                (lw, lh), bl = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 ly = max(y1 - 5, lh + 10)
-                overlay = annotated.copy()
-                cv2.rectangle(overlay,
-                              (x1, ly - lh - 5),
-                              (x1 + lw + 8, ly + baseline),
+
+                # Draw background rectangle directly (no overlay copy)
+                cv2.rectangle(annotated,
+                              (x1, ly - lh - 6),
+                              (x1 + lw + 8, ly + bl),
                               color, -1)
-                cv2.addWeighted(overlay, 0.7, annotated, 0.3, 0, annotated)
                 cv2.putText(annotated, label, (x1 + 4, ly - 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (255, 255, 255), 1, cv2.LINE_AA)
 
-    # Watermark
+    # Lightweight HUD (no per-frame string alloc pressure)
     cv2.putText(annotated,
-                f"YOLOv8 | conf:{confidence_threshold:.0%} | det:{det_count}",
-                (10, h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
+                f"YOLOv8n | {confidence_threshold:.0%} | det:{det_count}",
+                (10, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (160, 160, 160), 1, cv2.LINE_AA)
 
-    # ── Write to shared store (thread-safe) ───────────────────────────────────
+    # ── Update shared store ───────────────────────────────────────────────────
     with shared["lock"]:
-        shared["latest_frame"]    = annotated.copy()
+        shared["latest_frame"]    = annotated       # no extra copy
         shared["detection_count"] = det_count
-        shared["tracked_ids"]     = tracked_ids.copy()
+        shared["tracked_ids"]     = tracked_ids
 
     return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
 
-# ─── Layout columns ───────────────────────────────────────────────────────────
+# ─── Main layout ──────────────────────────────────────────────────────────────
 col_video, col_panel = st.columns([3, 1])
 
 with col_video:
-    # ── Stream ────────────────────────────────────────────────────────────────
     st.markdown('<div class="video-container">', unsafe_allow_html=True)
     ctx = webrtc_streamer(
         key="object-detection",
@@ -383,14 +413,14 @@ with col_video:
             "iceServers": [
                 {"urls": ["stun:stun.l.google.com:19302"]},
                 {"urls": ["stun:stun1.l.google.com:19302"]},
-                {"urls": ["stun:stun2.l.google.com:19302"]},
             ]
         },
         media_stream_constraints={
             "video": {
-                "width" : {"ideal": 1280},
-                "height": {"ideal": 720},
-                "frameRate": {"ideal": 30},
+                # Cap browser camera at 720 p — no need to send 1080p to Python
+                "width" : {"ideal": 1280, "max": 1280},
+                "height": {"ideal": 720,  "max": 720},
+                "frameRate": {"ideal": 24, "max": 30},
             },
             "audio": False,
         },
@@ -399,8 +429,13 @@ with col_video:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Capture bar ───────────────────────────────────────────────────────────
+    # ── Stats + capture row ───────────────────────────────────────────────────
     cap_col1, cap_col2, cap_col3 = st.columns([2, 2, 1])
+
+    with shared["lock"]:
+        live_det  = shared["detection_count"]
+        live_ids  = len(shared["tracked_ids"])
+        has_frame = shared["latest_frame"] is not None
 
     with cap_col1:
         capture_clicked = st.button(
@@ -409,12 +444,6 @@ with col_video:
             help="Save the current annotated frame",
             use_container_width=True,
         )
-
-    # Read shared stats (safe — only reading, lock still good practice)
-    with shared["lock"]:
-        live_det  = shared["detection_count"]
-        live_ids  = len(shared["tracked_ids"])
-        has_frame = shared["latest_frame"] is not None
 
     with cap_col2:
         st.markdown(f"""
@@ -457,8 +486,8 @@ with col_video:
                 key="dl_last",
             )
 
-    # ── Stream-active guard + capture logic ───────────────────────────────────
-    stream_running = ctx.state.playing if ctx and ctx.state else False
+    # ── Capture logic ─────────────────────────────────────────────────────────
+    stream_running = bool(ctx and ctx.state and ctx.state.playing)
 
     if capture_clicked:
         if not stream_running:
@@ -473,30 +502,31 @@ with col_video:
             if frame_to_save is None:
                 st.warning("Frame not ready yet — wait a moment and try again.")
             else:
-                save_img = frame_to_save.copy()
+                save_img = frame_to_save
                 now      = datetime.now()
 
                 if add_timestamp_watermark:
-                    wh, ww = save_img.shape[:2]
-                    ts_str = now.strftime("%Y-%m-%d  %H:%M:%S")
-                    (tw, th_), _ = cv2.getTextSize(
+                    ts_str   = now.strftime("%Y-%m-%d  %H:%M:%S")
+                    wh, ww   = save_img.shape[:2]
+                    (_, th_), _ = cv2.getTextSize(
                         ts_str, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-                    overlay = save_img.copy()
-                    cv2.rectangle(overlay,
-                                  (0, wh - th_ - 16), (ww, wh),
-                                  (0, 0, 0), -1)
-                    cv2.addWeighted(overlay, 0.55, save_img, 0.45, 0, save_img)
+                    bar_h    = th_ + 18
+                    # Dark bar — in-place alpha blend
+                    roi      = save_img[wh - bar_h:wh, :]
+                    dark     = (roi * 0.45).astype(np.uint8)
+                    save_img[wh - bar_h:wh, :] = dark
                     cv2.putText(save_img, ts_str, (10, wh - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                                (200, 200, 200), 1, cv2.LINE_AA)
+                                (210, 210, 210), 1, cv2.LINE_AA)
 
-                encode_params = [cv2.IMWRITE_JPEG_QUALITY, capture_quality]
-                ok, buf = cv2.imencode(".jpg", save_img, encode_params)
+                ok, buf = cv2.imencode(
+                    ".jpg", save_img,
+                    [cv2.IMWRITE_JPEG_QUALITY, capture_quality])
 
                 if ok:
-                    filename  = f"capture_{now.strftime('%Y%m%d_%H%M%S_%f')[:21]}.jpg"
+                    filename  = (f"capture_"
+                                 f"{now.strftime('%Y%m%d_%H%M%S_%f')[:21]}.jpg")
                     img_bytes = buf.tobytes()
-
                     disk_path = SAVE_DIR / filename
                     disk_path.write_bytes(img_bytes)
 
@@ -512,14 +542,13 @@ with col_video:
                     st.session_state.saved_frames.append(entry)
                     st.session_state.capture_meta = entry
 
-                    # Prune oldest beyond max
                     while len(st.session_state.saved_frames) > max_saved_frames:
-                        oldest = st.session_state.saved_frames.pop(0)
-                        p = Path(oldest["path"])
+                        old = st.session_state.saved_frames.pop(0)
+                        p   = Path(old["path"])
                         if p.exists():
                             p.unlink()
 
-                    st.success(f"Frame saved — {filename}")
+                    st.success(f"Saved — {filename}")
                     st.rerun()
                 else:
                     st.error("Encoding failed. Please try again.")
@@ -527,7 +556,6 @@ with col_video:
 
 # ─── Right panel ──────────────────────────────────────────────────────────────
 with col_panel:
-
     if st.session_state.capture_meta:
         meta = st.session_state.capture_meta
         st.markdown("""
@@ -581,11 +609,11 @@ with col_panel:
                   text-transform:uppercase;letter-spacing:1px;
                   margin-bottom:0.8rem;">How It Works</div>
       <div style="color:#a0aec0;font-size:0.8rem;line-height:1.8;">
-        <div style="margin-bottom:0.5rem;">1. Camera captures live video</div>
-        <div style="margin-bottom:0.5rem;">2. YOLOv8 detects objects</div>
-        <div style="margin-bottom:0.5rem;">3. BoT-SORT assigns unique IDs</div>
-        <div style="margin-bottom:0.5rem;">4. Trails show movement paths</div>
-        <div style="margin-bottom:0.5rem;">5. Labels show class &amp; confidence</div>
+        <div style="margin-bottom:0.4rem;">1. Camera captures live video</div>
+        <div style="margin-bottom:0.4rem;">2. YOLOv8n detects objects</div>
+        <div style="margin-bottom:0.4rem;">3. ByteTrack assigns unique IDs</div>
+        <div style="margin-bottom:0.4rem;">4. Trails show movement paths</div>
+        <div style="margin-bottom:0.4rem;">5. Labels show class &amp; confidence</div>
         <div>6. Click <b style="color:#e94560;">CAPTURE FRAME</b> to save</div>
       </div>
     </div>
@@ -593,13 +621,17 @@ with col_panel:
                 border:1px solid #2d3748;border-radius:10px;padding:1rem;">
       <div style="color:#e94560;font-size:0.85rem;font-weight:600;
                   text-transform:uppercase;letter-spacing:1px;
-                  margin-bottom:0.8rem;">Tips</div>
+                  margin-bottom:0.8rem;">Performance Tips</div>
       <div style="color:#a0aec0;font-size:0.8rem;line-height:1.8;">
-        <div style="margin-bottom:0.5rem;">• Good lighting improves detection</div>
-        <div style="margin-bottom:0.5rem;">• Lower confidence catches more objects</div>
-        <div style="margin-bottom:0.5rem;">• Trails help follow fast movement</div>
-        <div style="margin-bottom:0.5rem;">• Allow camera access when prompted</div>
-        <div>• Captures are saved to disk automatically</div>
+        <div style="margin-bottom:0.4rem;">
+            • Raise "Infer Every N Frames" to reduce CPU load</div>
+        <div style="margin-bottom:0.4rem;">
+            • Lower "Inference Resolution" for faster inference</div>
+        <div style="margin-bottom:0.4rem;">
+            • Disable trails if not needed</div>
+        <div style="margin-bottom:0.4rem;">
+            • Good lighting reduces false positives</div>
+        <div>• Use a GPU host for best performance</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -626,7 +658,8 @@ if st.session_state.saved_frames:
         st.download_button(
             label="DOWNLOAD ALL (ZIP)",
             data=zip_buf.getvalue(),
-            file_name=f"captures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            file_name=(f"captures_"
+                       f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"),
             mime="application/zip",
             use_container_width=True,
             key="dl_all_zip",
@@ -643,10 +676,9 @@ if st.session_state.saved_frames:
             st.session_state.capture_meta = None
             st.rerun()
 
-    # Thumbnail grid
     COLS = 4
     frames_rev = list(reversed(st.session_state.saved_frames))
-    for row_items in [frames_rev[i:i+COLS]
+    for row_items in [frames_rev[i:i + COLS]
                       for i in range(0, len(frames_rev), COLS)]:
         grid = st.columns(COLS)
         for col, item in zip(grid, row_items):
@@ -662,14 +694,17 @@ if st.session_state.saved_frames:
                             font-size:0.72rem;color:#a0aec0;
                             line-height:1.7;margin-bottom:0.3rem;">
                   <div><span style="color:#718096;">Time:</span>
-                       <span style="color:#e94560;">{item['timestamp']}</span></div>
+                       <span style="color:#e94560;">
+                           {item['timestamp']}</span></div>
                   <div><span style="color:#718096;">Objects:</span>
                        <span style="color:#e94560;">{item['detections']}</span>
                        &nbsp;|&nbsp;
                        <span style="color:#718096;">IDs:</span>
-                       <span style="color:#e94560;">{item['tracked']}</span></div>
+                       <span style="color:#e94560;">{item['tracked']}</span>
+                  </div>
                   <div><span style="color:#718096;">Size:</span>
-                       <span style="color:#e94560;">{item['size_kb']} KB</span></div>
+                       <span style="color:#e94560;">
+                           {item['size_kb']} KB</span></div>
                 </div>""", unsafe_allow_html=True)
                 st.download_button(
                     label="DOWNLOAD",
