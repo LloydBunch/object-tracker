@@ -1,6 +1,9 @@
-streamlit>=1.28.0
-streamlit-webrtc>=0.47.0
-ultralytics>=8.0.0
-opencv-python>=4.8.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.0.0
+streamlit>=1.36.0
+opencv-python-headless>=4.8.0,<5.0.0
 av>=10.0.0
+streamlit-webrtc>=0.45.0
+tornado>=6.0.0
+ultralytics>=8.0.0
+protobuf>=3.20.3,<5.0.0
+mediapipe==0.10.14

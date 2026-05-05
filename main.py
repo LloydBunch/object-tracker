@@ -51,22 +51,105 @@ st.markdown("""
         100% { opacity: 1; }
     }
 
-    .video-container {
-        border: 2px solid #e94560; border-radius: 12px;
-        overflow: hidden; box-shadow: 0 8px 30px rgba(233,69,96,0.3);
+    /* Video wrapper — position:relative so the gallery overlay sits inside */
+    .video-wrapper {
+        position: relative;
+        border: 2px solid #e94560;
+        border-radius: 12px;
+        overflow: hidden;
+        box-shadow: 0 8px 30px rgba(233,69,96,0.3);
+        background: #0a0a0a;
     }
 
+    /* Capture + stats bar sits flush below the video feed, inside the wrapper */
+    .capture-bar {
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        background: rgba(10,10,10,0.92);
+        border-top: 1px solid rgba(233,69,96,0.35);
+        padding: 0.6rem 1rem;
+    }
+
+    /* Stats pill */
+    .stat-pill {
+        display: flex; gap: 1.4rem; align-items: center;
+        background: rgba(233,69,96,0.06);
+        border: 1px solid rgba(233,69,96,0.22);
+        border-radius: 8px; padding: 0.35rem 1rem;
+        flex: 1;
+    }
+    .stat-item { text-align: center; }
+    .stat-val  { color: #e94560; font-size: 1.25rem; font-weight: 700; line-height: 1; }
+    .stat-lbl  { color: #718096; font-size: 0.62rem; text-transform: uppercase;
+                 letter-spacing: 0.8px; margin-top: 2px; }
+
+    /* ── Gallery panel — sits INSIDE .video-wrapper, below capture-bar ── */
+    .gallery-panel {
+        background: rgba(10,10,10,0.95);
+        border-top: 1px solid rgba(233,69,96,0.25);
+        padding: 0.8rem 1rem;
+        max-height: 260px;
+        overflow-y: auto;
+        overflow-x: hidden;
+    }
+    .gallery-panel::-webkit-scrollbar { width: 4px; }
+    .gallery-panel::-webkit-scrollbar-track { background: #1a1a2e; }
+    .gallery-panel::-webkit-scrollbar-thumb {
+        background: #e94560; border-radius: 2px;
+    }
+
+    .gallery-panel-header {
+        display: flex; justify-content: space-between; align-items: center;
+        margin-bottom: 0.6rem;
+    }
+    .gallery-panel-title {
+        color: #e94560; font-size: 0.78rem; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 1.2px;
+    }
+
+    /* Horizontal scroll strip for thumbnails */
+    .thumb-strip {
+        display: flex; gap: 0.6rem; overflow-x: auto;
+        padding-bottom: 0.4rem;
+    }
+    .thumb-strip::-webkit-scrollbar { height: 3px; }
+    .thumb-strip::-webkit-scrollbar-thumb {
+        background: #e94560; border-radius: 2px;
+    }
+    .thumb-card {
+        flex: 0 0 120px;
+        background: #16213e;
+        border: 1px solid #2d3748;
+        border-radius: 7px;
+        overflow: hidden;
+        transition: border-color 0.2s;
+    }
+    .thumb-card:hover { border-color: #e94560; }
+    .thumb-meta {
+        padding: 0.3rem 0.4rem;
+        font-size: 0.62rem;
+        color: #a0aec0;
+        line-height: 1.5;
+    }
+    .thumb-meta span { color: #e94560; font-weight: 600; }
+
+    /* Download buttons */
     .stDownloadButton > button {
         background: linear-gradient(135deg, #0f3460, #16213e) !important;
         color: white !important; border: 1px solid #e94560 !important;
-        border-radius: 8px !important; font-weight: 600 !important;
-        letter-spacing: 1px !important; transition: all 0.3s ease !important;
+        border-radius: 6px !important; font-weight: 600 !important;
+        font-size: 0.7rem !important; letter-spacing: 0.8px !important;
+        padding: 0.25rem 0.5rem !important;
+        transition: all 0.2s ease !important;
+        width: 100% !important;
     }
     .stDownloadButton > button:hover {
         background: linear-gradient(135deg, #e94560, #c73652) !important;
-        transform: translateY(-2px) !important;
+        transform: translateY(-1px) !important;
     }
 
+    /* Sidebar */
     .sidebar-title {
         color: #e94560; font-size: 0.85rem; font-weight: 600;
         text-transform: uppercase; letter-spacing: 1px;
@@ -74,6 +157,7 @@ st.markdown("""
         border-bottom: 1px solid rgba(233,69,96,0.2);
     }
 
+    /* Right panel */
     .capture-info {
         background: rgba(233,69,96,0.05);
         border: 1px solid rgba(233,69,96,0.2);
@@ -102,16 +186,11 @@ st.markdown("""
         color: #a0aec0 !important; font-size: 0.85rem;
         text-transform: uppercase; letter-spacing: 0.5px;
     }
-
-    /* Capture button */
-    div[data-testid="stButton"] button {
-        transition: all 0.2s ease !important;
-    }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ─── Global shared store via cache_resource (survives reruns, thread-safe) ────
+# ─── Shared / cached resources ────────────────────────────────────────────────
 @st.cache_resource
 def get_shared_store():
     return {
@@ -125,19 +204,15 @@ def get_shared_store():
 def get_track_history():
     return defaultdict(list)
 
-# ─── Model — load once, warm up immediately ───────────────────────────────────
 @st.cache_resource
 def load_model():
     m = YOLO("yolov8n.pt")
-    # Warm-up pass so first real frame isn't slow
     dummy = np.zeros((480, 640, 3), dtype=np.uint8)
     m.predict(dummy, verbose=False)
     return m
 
-# ─── Frame-skip counter (module-level int inside a mutable container) ─────────
 @st.cache_resource
 def get_frame_counter():
-    # [current_count, skip_every_n]
     return {"count": 0, "last_result": None}
 
 
@@ -170,8 +245,7 @@ COCO_CLASSES = {
     79:'toothbrush',
 }
 
-# Pre-compute colors once
-_CLASS_COLORS: dict[int, tuple] = {}
+_CLASS_COLORS: dict = {}
 def get_class_color(class_id: int) -> tuple:
     if class_id not in _CLASS_COLORS:
         rng = np.random.default_rng(class_id)
@@ -186,7 +260,7 @@ for k, v in [("saved_frames", []), ("capture_meta", None),
         st.session_state[k] = v
 
 
-# ─── Sidebar (read before callback so values are ready) ───────────────────────
+# ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("""
     <div style="text-align:center;padding:1rem 0;
@@ -205,18 +279,13 @@ with st.sidebar:
 
     st.markdown('<div class="sidebar-title">Performance</div>',
                 unsafe_allow_html=True)
-    # Key perf knob: only run inference every N frames
     infer_every = st.slider(
         "Infer Every N Frames", 1, 6, 2, 1,
         help="Skip frames between inferences. Higher = faster but less smooth.")
-    
-    # Resolution scale: downscale before inference, display original
     infer_scale = st.select_slider(
         "Inference Resolution",
-        options=[0.25, 0.5, 0.75, 1.0],
-        value=0.5,
-        help="Lower = faster inference. Display is always full resolution."
-    )
+        options=[0.25, 0.5, 0.75, 1.0], value=0.5,
+        help="Lower = faster inference. Display is always full resolution.")
 
     st.markdown('<div class="sidebar-title">Tracking Settings</div>',
                 unsafe_allow_html=True)
@@ -277,7 +346,6 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     frame_counter["count"] = (frame_counter["count"] + 1) % max(infer_every, 1)
     run_inference = (frame_counter["count"] == 0)
 
-    # ── Downscale for inference only ──────────────────────────────────────────
     if infer_scale < 1.0:
         small_w = int(w * infer_scale)
         small_h = int(h * infer_scale)
@@ -290,18 +358,17 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
     scale_x = w / small_w
     scale_y = h / small_h
 
-    annotated   = img.copy()      # draw on full-res
+    annotated   = img.copy()
     det_count   = 0
     tracked_ids = set()
 
     if run_inference:
         results = model.track(
-            infer_img,
-            persist=True,
+            infer_img, persist=True,
             conf=confidence_threshold,
             verbose=False,
-            tracker="bytetrack.yaml",   # lighter than botsort
-            imgsz=640,                  # fixed inference size cap
+            tracker="bytetrack.yaml",
+            imgsz=640,
         )
         frame_counter["last_result"] = results
     else:
@@ -315,12 +382,9 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
         det_count = len(boxes)
 
         for box in boxes:
-            # Scale coords back to full resolution
             x1s, y1s, x2s, y2s = box.xyxy[0].tolist()
-            x1 = int(x1s * scale_x)
-            y1 = int(y1s * scale_y)
-            x2 = int(x2s * scale_x)
-            y2 = int(y2s * scale_y)
+            x1 = int(x1s * scale_x); y1 = int(y1s * scale_y)
+            x2 = int(x2s * scale_x); y2 = int(y2s * scale_y)
 
             conf       = float(box.conf[0])
             cls_id     = int(box.cls[0])
@@ -332,11 +396,8 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
 
             color = get_class_color(cls_id)
 
-            # Bounding box
-            cv2.rectangle(annotated, (x1, y1), (x2, y2),
-                          color, bbox_thickness)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, bbox_thickness)
 
-            # Corner accents
             cl = max(1, min(15, (x2 - x1) // 4, (y2 - y1) // 4))
             for px, py, dx, dy in [
                 (x1, y1,  1,  1), (x2, y1, -1,  1),
@@ -347,7 +408,6 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
                 cv2.line(annotated, (px, py), (px, py + dy * cl),
                          color, bbox_thickness + 1)
 
-            # Movement trail
             if show_trails and track_id is not None:
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                 hist = track_history[track_id]
@@ -360,7 +420,6 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
                     cv2.line(annotated, hist[i - 1], hist[i],
                              tc, max(1, int(bbox_thickness * alpha)))
 
-            # Label
             if show_labels:
                 parts = []
                 if track_id is not None:
@@ -373,26 +432,20 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
                 (lw, lh), bl = cv2.getTextSize(
                     label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 ly = max(y1 - 5, lh + 10)
-
-                # Draw background rectangle directly (no overlay copy)
                 cv2.rectangle(annotated,
-                              (x1, ly - lh - 6),
-                              (x1 + lw + 8, ly + bl),
+                              (x1, ly - lh - 6), (x1 + lw + 8, ly + bl),
                               color, -1)
                 cv2.putText(annotated, label, (x1 + 4, ly - 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             (255, 255, 255), 1, cv2.LINE_AA)
 
-    # Lightweight HUD (no per-frame string alloc pressure)
     cv2.putText(annotated,
                 f"YOLOv8n | {confidence_threshold:.0%} | det:{det_count}",
-                (10, h - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                 (160, 160, 160), 1, cv2.LINE_AA)
 
-    # ── Update shared store ───────────────────────────────────────────────────
     with shared["lock"]:
-        shared["latest_frame"]    = annotated       # no extra copy
+        shared["latest_frame"]    = annotated
         shared["detection_count"] = det_count
         shared["tracked_ids"]     = tracked_ids
 
@@ -403,7 +456,16 @@ def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
 col_video, col_panel = st.columns([3, 1])
 
 with col_video:
-    st.markdown('<div class="video-container">', unsafe_allow_html=True)
+
+    # ── Read live stats before rendering ──────────────────────────────────────
+    with shared["lock"]:
+        live_det  = shared["detection_count"]
+        live_ids  = len(shared["tracked_ids"])
+
+    # ══ VIDEO WRAPPER opens here ══════════════════════════════════════════════
+    st.markdown('<div class="video-wrapper">', unsafe_allow_html=True)
+
+    # 1. The actual WebRTC stream
     ctx = webrtc_streamer(
         key="object-detection",
         mode=WebRtcMode.SENDRECV,
@@ -417,7 +479,6 @@ with col_video:
         },
         media_stream_constraints={
             "video": {
-                # Cap browser camera at 720 p — no need to send 1080p to Python
                 "width" : {"ideal": 1280, "max": 1280},
                 "height": {"ideal": 720,  "max": 720},
                 "frameRate": {"ideal": 24, "max": 30},
@@ -425,19 +486,16 @@ with col_video:
             "audio": False,
         },
     )
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    # 2. Capture bar — flush below the video feed, still inside the wrapper
+    #    We use Streamlit columns rendered inside the wrapper div.
+    st.markdown("""
+    <div class="capture-bar" id="capture-bar-anchor"></div>
+    """, unsafe_allow_html=True)
 
-    # ── Stats + capture row ───────────────────────────────────────────────────
-    cap_col1, cap_col2, cap_col3 = st.columns([2, 2, 1])
+    bar_c1, bar_c2, bar_c3 = st.columns([2, 2, 1])
 
-    with shared["lock"]:
-        live_det  = shared["detection_count"]
-        live_ids  = len(shared["tracked_ids"])
-        has_frame = shared["latest_frame"] is not None
-
-    with cap_col1:
+    with bar_c1:
         capture_clicked = st.button(
             "CAPTURE FRAME",
             key="capture_btn",
@@ -445,36 +503,24 @@ with col_video:
             use_container_width=True,
         )
 
-    with cap_col2:
+    with bar_c2:
         st.markdown(f"""
-        <div style="background:rgba(233,69,96,0.05);
-                    border:1px solid rgba(233,69,96,0.2);
-                    border-radius:8px;padding:0.6rem 1rem;
-                    display:flex;gap:2rem;align-items:center;">
-          <div style="text-align:center;">
-            <div style="color:#e94560;font-size:1.4rem;font-weight:700;">
-                {live_det}</div>
-            <div style="color:#718096;font-size:0.7rem;
-                        text-transform:uppercase;letter-spacing:1px;">
-                Detections</div>
+        <div class="stat-pill">
+          <div class="stat-item">
+            <div class="stat-val">{live_det}</div>
+            <div class="stat-lbl">Detections</div>
           </div>
-          <div style="text-align:center;">
-            <div style="color:#e94560;font-size:1.4rem;font-weight:700;">
-                {live_ids}</div>
-            <div style="color:#718096;font-size:0.7rem;
-                        text-transform:uppercase;letter-spacing:1px;">
-                Tracked IDs</div>
+          <div class="stat-item">
+            <div class="stat-val">{live_ids}</div>
+            <div class="stat-lbl">Tracked IDs</div>
           </div>
-          <div style="text-align:center;">
-            <div style="color:#e94560;font-size:1.4rem;font-weight:700;">
-                {len(st.session_state.saved_frames)}</div>
-            <div style="color:#718096;font-size:0.7rem;
-                        text-transform:uppercase;letter-spacing:1px;">
-                Saved</div>
+          <div class="stat-item">
+            <div class="stat-val">{len(st.session_state.saved_frames)}</div>
+            <div class="stat-lbl">Saved</div>
           </div>
         </div>""", unsafe_allow_html=True)
 
-    with cap_col3:
+    with bar_c3:
         if st.session_state.saved_frames:
             last = st.session_state.saved_frames[-1]
             st.download_button(
@@ -486,7 +532,85 @@ with col_video:
                 key="dl_last",
             )
 
-    # ── Capture logic ─────────────────────────────────────────────────────────
+    # 3. ── Saved-frames gallery panel — inside the wrapper, below capture bar ─
+    if st.session_state.saved_frames:
+
+        # Gallery header row (HTML only — no Streamlit buttons here yet)
+        st.markdown(f"""
+        <div class="gallery-panel">
+          <div class="gallery-panel-header">
+            <span class="gallery-panel-title">
+                Saved Frames &nbsp;({len(st.session_state.saved_frames)})
+            </span>
+          </div>
+          <!-- thumbnail cards are injected by st.columns below -->
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Render thumbnails in a tight 4-up grid
+        frames_rev = list(reversed(st.session_state.saved_frames))
+
+        # Gallery action buttons (Download All / Clear All)
+        ga1, ga2, ga_spacer = st.columns([1.2, 1.2, 3])
+        with ga1:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in st.session_state.saved_frames:
+                    zf.writestr(f["filename"], f["bytes"])
+            zip_buf.seek(0)
+            st.download_button(
+                label="DOWNLOAD ALL (ZIP)",
+                data=zip_buf.getvalue(),
+                file_name=(
+                    f"captures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"),
+                mime="application/zip",
+                use_container_width=True,
+                key="dl_all_zip",
+            )
+        with ga2:
+            if st.button("CLEAR ALL", use_container_width=True,
+                         key="clear_all"):
+                for f in st.session_state.saved_frames:
+                    p = Path(f["path"])
+                    if p.exists():
+                        p.unlink()
+                st.session_state.saved_frames.clear()
+                st.session_state.capture_meta = None
+                st.rerun()
+
+        # Thumbnail grid — 4 columns, newest first
+        COLS = 4
+        for row_items in [frames_rev[i:i + COLS]
+                          for i in range(0, len(frames_rev), COLS)]:
+            grid = st.columns(COLS)
+            for gcol, item in zip(grid, row_items):
+                with gcol:
+                    nparr   = np.frombuffer(item["bytes"], np.uint8)
+                    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                    st.image(img_rgb, use_container_width=True)
+                    st.markdown(f"""
+                    <div class="thumb-meta">
+                      <div>{item['timestamp']}</div>
+                      <div>
+                        <span>{item['detections']}</span> obj &nbsp;|&nbsp;
+                        <span>{item['tracked']}</span> IDs &nbsp;|&nbsp;
+                        <span>{item['size_kb']}</span> KB
+                      </div>
+                    </div>""", unsafe_allow_html=True)
+                    st.download_button(
+                        label="DOWNLOAD",
+                        data=item["bytes"],
+                        file_name=item["filename"],
+                        mime="image/jpeg",
+                        use_container_width=True,
+                        key=f"dl_{item['filename']}",
+                    )
+
+    # ══ VIDEO WRAPPER closes here ═════════════════════════════════════════════
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Capture logic (runs after UI is rendered) ─────────────────────────────
     stream_running = bool(ctx and ctx.state and ctx.state.playing)
 
     if capture_clicked:
@@ -506,15 +630,13 @@ with col_video:
                 now      = datetime.now()
 
                 if add_timestamp_watermark:
-                    ts_str   = now.strftime("%Y-%m-%d  %H:%M:%S")
-                    wh, ww   = save_img.shape[:2]
+                    ts_str      = now.strftime("%Y-%m-%d  %H:%M:%S")
+                    wh, ww      = save_img.shape[:2]
                     (_, th_), _ = cv2.getTextSize(
                         ts_str, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-                    bar_h    = th_ + 18
-                    # Dark bar — in-place alpha blend
-                    roi      = save_img[wh - bar_h:wh, :]
-                    dark     = (roi * 0.45).astype(np.uint8)
-                    save_img[wh - bar_h:wh, :] = dark
+                    bar_h       = th_ + 18
+                    roi         = save_img[wh - bar_h:wh, :]
+                    save_img[wh - bar_h:wh, :] = (roi * 0.45).astype(np.uint8)
                     cv2.putText(save_img, ts_str, (10, wh - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                                 (210, 210, 210), 1, cv2.LINE_AA)
@@ -613,7 +735,8 @@ with col_panel:
         <div style="margin-bottom:0.4rem;">2. YOLOv8n detects objects</div>
         <div style="margin-bottom:0.4rem;">3. ByteTrack assigns unique IDs</div>
         <div style="margin-bottom:0.4rem;">4. Trails show movement paths</div>
-        <div style="margin-bottom:0.4rem;">5. Labels show class &amp; confidence</div>
+        <div style="margin-bottom:0.4rem;">
+            5. Labels show class &amp; confidence</div>
         <div>6. Click <b style="color:#e94560;">CAPTURE FRAME</b> to save</div>
       </div>
     </div>
@@ -627,8 +750,7 @@ with col_panel:
             • Raise "Infer Every N Frames" to reduce CPU load</div>
         <div style="margin-bottom:0.4rem;">
             • Lower "Inference Resolution" for faster inference</div>
-        <div style="margin-bottom:0.4rem;">
-            • Disable trails if not needed</div>
+        <div style="margin-bottom:0.4rem;">• Disable trails if not needed</div>
         <div style="margin-bottom:0.4rem;">
             • Good lighting reduces false positives</div>
         <div>• Use a GPU host for best performance</div>
@@ -636,84 +758,6 @@ with col_panel:
     </div>
     """, unsafe_allow_html=True)
 
-
-# ─── Gallery ──────────────────────────────────────────────────────────────────
-if st.session_state.saved_frames:
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown("""
-    <div style="border-top:1px solid #2d3748;padding-top:1.5rem;">
-      <div style="color:#e94560;font-size:1rem;font-weight:700;
-                  text-transform:uppercase;letter-spacing:2px;
-                  margin-bottom:1rem;">Saved Frames Gallery</div>
-    </div>""", unsafe_allow_html=True)
-
-    g1, g2, _ = st.columns([1, 1, 4])
-
-    with g1:
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in st.session_state.saved_frames:
-                zf.writestr(f["filename"], f["bytes"])
-        zip_buf.seek(0)
-        st.download_button(
-            label="DOWNLOAD ALL (ZIP)",
-            data=zip_buf.getvalue(),
-            file_name=(f"captures_"
-                       f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"),
-            mime="application/zip",
-            use_container_width=True,
-            key="dl_all_zip",
-        )
-
-    with g2:
-        if st.button("CLEAR ALL CAPTURES",
-                     use_container_width=True, key="clear_all"):
-            for f in st.session_state.saved_frames:
-                p = Path(f["path"])
-                if p.exists():
-                    p.unlink()
-            st.session_state.saved_frames.clear()
-            st.session_state.capture_meta = None
-            st.rerun()
-
-    COLS = 4
-    frames_rev = list(reversed(st.session_state.saved_frames))
-    for row_items in [frames_rev[i:i + COLS]
-                      for i in range(0, len(frames_rev), COLS)]:
-        grid = st.columns(COLS)
-        for col, item in zip(grid, row_items):
-            with col:
-                nparr   = np.frombuffer(item["bytes"], np.uint8)
-                img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                st.image(img_rgb, use_container_width=True)
-                st.markdown(f"""
-                <div style="background:rgba(233,69,96,0.05);
-                            border:1px solid rgba(233,69,96,0.15);
-                            border-radius:6px;padding:0.4rem 0.6rem;
-                            font-size:0.72rem;color:#a0aec0;
-                            line-height:1.7;margin-bottom:0.3rem;">
-                  <div><span style="color:#718096;">Time:</span>
-                       <span style="color:#e94560;">
-                           {item['timestamp']}</span></div>
-                  <div><span style="color:#718096;">Objects:</span>
-                       <span style="color:#e94560;">{item['detections']}</span>
-                       &nbsp;|&nbsp;
-                       <span style="color:#718096;">IDs:</span>
-                       <span style="color:#e94560;">{item['tracked']}</span>
-                  </div>
-                  <div><span style="color:#718096;">Size:</span>
-                       <span style="color:#e94560;">
-                           {item['size_kb']} KB</span></div>
-                </div>""", unsafe_allow_html=True)
-                st.download_button(
-                    label="DOWNLOAD",
-                    data=item["bytes"],
-                    file_name=item["filename"],
-                    mime="image/jpeg",
-                    use_container_width=True,
-                    key=f"dl_{item['filename']}",
-                )
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
 st.markdown("""
